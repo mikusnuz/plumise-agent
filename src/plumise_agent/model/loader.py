@@ -396,7 +396,7 @@ class ModelLoader:
         # have meta buffers (inv_freq is a runtime buffer not saved in
         # safetensors), so we re-create it from config if needed.
         rotary_emb = _fix_rotary_emb(
-            _get_rotary_emb(body), self._model_config, target,
+            _get_rotary_emb(body), self._model_config, self._device,
         )
 
         # Remove accelerate hooks to avoid autocast issues on CPU
