@@ -199,14 +199,22 @@ class OracleRegistry:
         Returns:
             Tuple of (ram_mb, vram_mb, device_string).
         """
-        # RAM
-        ram_mb = 16384  # conservative default
-        try:
-            import psutil  # type: ignore[import-untyped]
+        import os
 
-            ram_mb = psutil.virtual_memory().total // (1024 * 1024)
-        except ImportError:
-            logger.debug("psutil not installed; using default RAM estimate")
+        # RAM - prefer env override, then available memory, then total
+        env_ram = os.environ.get("RAM_MB")
+        if env_ram:
+            ram_mb = int(env_ram)
+            logger.info("Using RAM_MB from env: %d MB", ram_mb)
+        else:
+            ram_mb = 16384  # conservative default
+            try:
+                import psutil  # type: ignore[import-untyped]
+
+                ram_mb = psutil.virtual_memory().available // (1024 * 1024)
+                logger.info("Detected available RAM: %d MB", ram_mb)
+            except ImportError:
+                logger.debug("psutil not installed; using default RAM estimate")
 
         # Device and VRAM
         device = self.config.device
