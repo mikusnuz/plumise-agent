@@ -7,7 +7,7 @@ that manages:
 3. Partial or full model loading based on the assignment
 4. gRPC server for inter-node pipeline communication
 5. HTTP API for the InferenceAPI gateway
-6. Periodic metrics reporting, heartbeat, and reward claiming
+6. Periodic metrics reporting (heartbeat and reward claiming are Oracle-sponsored)
 7. Live topology refresh for node join/leave events
 """
 
@@ -154,8 +154,6 @@ class PlumiseAgent:
         await self.reporter.start(self.metrics)
 
         tasks = [
-            asyncio.create_task(self._heartbeat_loop(), name="heartbeat"),
-            asyncio.create_task(self._reward_check_loop(), name="reward-check"),
             asyncio.create_task(self._topology_refresh_loop(), name="topology-refresh"),
         ]
 
@@ -405,39 +403,6 @@ class PlumiseAgent:
     # ------------------------------------------------------------------
     # Background maintenance loops
     # ------------------------------------------------------------------
-
-    async def _heartbeat_loop(self) -> None:
-        """Periodically send heartbeat to the chain (every 5 minutes)."""
-        interval = 300  # seconds
-        while self._running:
-            try:
-                await asyncio.sleep(interval)
-
-                loop = asyncio.get_running_loop()
-                success = await loop.run_in_executor(None, self.chain_agent.heartbeat)
-
-                if success:
-                    logger.debug("Heartbeat sent successfully")
-                else:
-                    logger.warning("Heartbeat failed")
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("Error in heartbeat loop")
-
-    async def _reward_check_loop(self) -> None:
-        """Periodically check and claim rewards when threshold is met."""
-        interval = max(self.config.report_interval * 5, 300)
-        while self._running:
-            try:
-                await asyncio.sleep(interval)
-                tx_hash = self.rewards.claim_if_ready()
-                if tx_hash:
-                    logger.info("Reward claimed! tx=%s", tx_hash)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("Error in reward check loop")
 
     async def _topology_refresh_loop(self) -> None:
         """Periodically refresh the pipeline topology from the Oracle.
