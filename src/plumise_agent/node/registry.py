@@ -95,6 +95,12 @@ class OracleRegistry:
                 async with session.post(url, json=payload) as resp:
                     if resp.status in (200, 201):
                         data = await resp.json()
+                        if not data.get("success"):
+                            logger.error(
+                                "Oracle registration rejected: %s",
+                                data.get("message", "unknown"),
+                            )
+                            return None
                         layer_range = LayerRange(
                             start=data["layerStart"],
                             end=data["layerEnd"],
