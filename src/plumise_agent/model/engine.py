@@ -1,0 +1,414 @@
+"""Inference engine for running forward passes through loaded model layers.
+
+``InferenceEngine`` supports four operational modes depending on where
+this node sits in the distributed pipeline:
+
+- **full**: Complete model inference (single-node deployment).
+- **first**: Embedding + partial layers -> hidden states (sent to next node).
+- **middle**: Hidden states -> partial layers -> hidden states.
+- **last**: Hidden states -> remaining layers + lm_head -> generated text.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+
+from plumise_agent.model.loader import ModelParts
+
+logger = logging.getLogger(__name__)
+
+
+class InferenceEngine:
+    """Runs forward passes through loaded model layers.
+
+    Thread-safe: a ``threading.Lock`` guards all forward operations to
+    prevent concurrent use of the model weights.
+
+    Args:
+        model_parts: Loaded model components from ``ModelLoader``.
+        tokenizer: HuggingFace tokenizer instance.
+        device: Device string where tensors live (``"cpu"``, ``"cuda"``, etc.).
+    """
+
+    def __init__(
+        self,
+        model_parts: ModelParts,
+        tokenizer: Any,
+        device: str,
+    ) -> None:
+        self.parts = model_parts
+        self.tokenizer = tokenizer
+        self.device = device
+        self._lock = threading.Lock()
+
+        logger.info(
+            "InferenceEngine ready: layers=[%d,%d) of %d, device=%s",
+            model_parts.layer_range.start,
+            model_parts.layer_range.end,
+            model_parts.layer_range.total,
+            device,
+        )
+
+    # ------------------------------------------------------------------
+    # Full model inference (single-node)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def forward_full(
+        self,
+        prompt: str,
+        max_new_tokens: int = 128,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.2,
+        do_sample: bool = True,
+    ) -> tuple[str, int]:
+        """Run complete autoregressive generation on a single node.
+
+        Args:
+            prompt: Input text.
+            max_new_tokens: Maximum number of tokens to generate.
+            temperature: Sampling temperature.
+            top_p: Nucleus sampling threshold.
+            repetition_penalty: Penalty for repeating tokens.
+            do_sample: Whether to sample (``False`` for greedy).
+
+        Returns:
+            ``(generated_text, num_tokens)`` tuple.
+        """
+        with self._lock:
+            t0 = time.perf_counter()
+
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+            input_ids = inputs["input_ids"]
+
+            generated_ids = self._autoregressive_loop(
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                do_sample=do_sample,
+            )
+
+            # Decode only the newly generated tokens
+            new_ids = generated_ids[:, input_ids.shape[1]:]
+            text = self.tokenizer.decode(new_ids[0], skip_special_tokens=True)
+            num_tokens = new_ids.shape[1]
+
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.debug(
+                "forward_full: %d tokens in %.1f ms (%.1f tok/s)",
+                num_tokens,
+                elapsed,
+                num_tokens / (elapsed / 1000) if elapsed > 0 else 0,
+            )
+            return text, num_tokens
+
+    # ------------------------------------------------------------------
+    # First node: embed + layers -> hidden states
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def forward_first(self, prompt: str) -> torch.Tensor:
+        """First-node forward: tokenize, embed, run through assigned layers.
+
+        Args:
+            prompt: Input text to process.
+
+        Returns:
+            Hidden-states tensor of shape ``(batch, seq_len, hidden_dim)``.
+        """
+        with self._lock:
+            t0 = time.perf_counter()
+
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+            input_ids = inputs["input_ids"]
+            attention_mask = inputs.get("attention_mask")
+
+            if self.parts.embedding is None:
+                raise RuntimeError("forward_first requires an embedding module")
+
+            hidden_states = self.parts.embedding(input_ids)
+
+            # Prepare causal mask / position ids if needed
+            hidden_states = self._run_through_layers(
+                hidden_states, attention_mask=attention_mask
+            )
+
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.debug(
+                "forward_first: shape=%s in %.1f ms", list(hidden_states.shape), elapsed
+            )
+            return hidden_states
+
+    # ------------------------------------------------------------------
+    # Middle node: hidden states -> layers -> hidden states
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def forward_middle(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Middle-node forward: process hidden states through assigned layers.
+
+        Args:
+            hidden_states: Input tensor from the previous node.
+            attention_mask: Optional attention mask.
+
+        Returns:
+            Processed hidden-states tensor.
+        """
+        with self._lock:
+            t0 = time.perf_counter()
+
+            hidden_states = hidden_states.to(self.device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+
+            hidden_states = self._run_through_layers(
+                hidden_states, attention_mask=attention_mask
+            )
+
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.debug(
+                "forward_middle: shape=%s in %.1f ms",
+                list(hidden_states.shape),
+                elapsed,
+            )
+            return hidden_states
+
+    # ------------------------------------------------------------------
+    # Last node: hidden states -> layers + norm + lm_head -> text
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def forward_last(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        max_new_tokens: int = 128,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.2,
+        do_sample: bool = True,
+    ) -> tuple[str, int]:
+        """Last-node forward: remaining layers + lm_head + autoregressive sampling.
+
+        Args:
+            hidden_states: Input tensor from the previous node.
+            attention_mask: Optional attention mask.
+            max_new_tokens: Maximum number of tokens to generate.
+            temperature: Sampling temperature.
+            top_p: Nucleus sampling threshold.
+            repetition_penalty: Penalty for repeating tokens.
+            do_sample: Whether to sample (``False`` for greedy).
+
+        Returns:
+            ``(generated_text, num_tokens)`` tuple.
+        """
+        with self._lock:
+            t0 = time.perf_counter()
+
+            hidden_states = hidden_states.to(self.device)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+
+            if self.parts.lm_head is None:
+                raise RuntimeError("forward_last requires a lm_head module")
+
+            # Run through remaining layers
+            hidden_states = self._run_through_layers(
+                hidden_states, attention_mask=attention_mask
+            )
+
+            # Apply final layer norm
+            if self.parts.norm is not None:
+                hidden_states = self.parts.norm(hidden_states)
+
+            # Autoregressive generation from the last hidden state
+            generated_tokens: list[int] = []
+            eos_token_id = self.tokenizer.eos_token_id
+
+            # Start with the logits from the last position
+            current_hidden = hidden_states
+
+            for _ in range(max_new_tokens):
+                # Get logits for the last position
+                logits = self.parts.lm_head(current_hidden[:, -1:, :])
+                logits = logits[:, -1, :]  # (batch, vocab)
+
+                # Apply repetition penalty
+                if repetition_penalty != 1.0 and generated_tokens:
+                    logits = self._apply_repetition_penalty(
+                        logits, generated_tokens, repetition_penalty
+                    )
+
+                # Sample next token
+                next_token_id = self._sample_token(
+                    logits,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=do_sample,
+                )
+
+                if next_token_id == eos_token_id:
+                    break
+
+                generated_tokens.append(next_token_id)
+
+                # For subsequent tokens we would need embedding + full layers,
+                # but in pipeline mode the last node only has final layers.
+                # In practice, distributed autoregressive generation requires
+                # the full pipeline for each new token. For the initial
+                # implementation we generate one "pass" worth of output from
+                # the final hidden states.
+                break
+
+            text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            num_tokens = len(generated_tokens)
+
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.debug(
+                "forward_last: %d tokens in %.1f ms", num_tokens, elapsed
+            )
+            return text, num_tokens
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _run_through_layers(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Pass hidden states through all layers in ``self.parts.layers``.
+
+        Handles different layer calling conventions across model architectures.
+        """
+        for layer in self.parts.layers:
+            layer_output = layer(hidden_states, attention_mask=attention_mask)
+            # Most layers return a tuple (hidden_states, ...) or just a tensor
+            if isinstance(layer_output, tuple):
+                hidden_states = layer_output[0]
+            else:
+                hidden_states = layer_output
+        return hidden_states
+
+    def _autoregressive_loop(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: float,
+        do_sample: bool,
+    ) -> torch.Tensor:
+        """Full-model autoregressive generation loop.
+
+        Processes one token at a time through the complete model
+        (embedding -> layers -> norm -> lm_head -> sample).
+        """
+        eos_token_id = self.tokenizer.eos_token_id
+        generated_ids = input_ids.clone()
+
+        for _ in range(max_new_tokens):
+            # Embed
+            hidden_states = self.parts.embedding(generated_ids)
+
+            # Run through all layers
+            hidden_states = self._run_through_layers(hidden_states)
+
+            # Final norm
+            if self.parts.norm is not None:
+                hidden_states = self.parts.norm(hidden_states)
+
+            # LM head
+            logits = self.parts.lm_head(hidden_states[:, -1:, :])
+            logits = logits[:, -1, :]  # (batch, vocab)
+
+            # Repetition penalty
+            if repetition_penalty != 1.0:
+                past_tokens = generated_ids[0].tolist()
+                logits = self._apply_repetition_penalty(
+                    logits, past_tokens, repetition_penalty
+                )
+
+            # Sample
+            next_token_id = self._sample_token(
+                logits,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=do_sample,
+            )
+
+            if next_token_id == eos_token_id:
+                break
+
+            next_token = torch.tensor(
+                [[next_token_id]], dtype=torch.long, device=self.device
+            )
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+
+        return generated_ids
+
+    @staticmethod
+    def _apply_repetition_penalty(
+        logits: torch.Tensor,
+        past_token_ids: list[int],
+        penalty: float,
+    ) -> torch.Tensor:
+        """Penalise logits for tokens that have already appeared."""
+        if not past_token_ids:
+            return logits
+        unique_ids = list(set(past_token_ids))
+        score = logits[:, unique_ids]
+        # If score > 0 divide by penalty, if score < 0 multiply by penalty
+        score = torch.where(score > 0, score / penalty, score * penalty)
+        logits[:, unique_ids] = score
+        return logits
+
+    @staticmethod
+    def _sample_token(
+        logits: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        do_sample: bool,
+    ) -> int:
+        """Sample a single token from logits.
+
+        Applies temperature scaling and top-p (nucleus) filtering before
+        sampling. Falls back to greedy argmax when ``do_sample=False``.
+        """
+        if not do_sample:
+            return int(torch.argmax(logits, dim=-1).item())
+
+        # Temperature scaling
+        if temperature > 0 and temperature != 1.0:
+            logits = logits / temperature
+
+        # Top-p filtering
+        if 0 < top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+            # Remove tokens with cumulative probability above the threshold
+            sorted_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+            sorted_logits[sorted_mask] = float("-inf")
+
+            # Scatter back
+            logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
+
+        # Sample from the distribution
+        probs = F.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        return int(next_token.item())

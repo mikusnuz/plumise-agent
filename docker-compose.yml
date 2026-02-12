@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  plumise-agent:
+    build: .
+    container_name: plumise-agent
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ./model-cache:/root/.cache/huggingface
+    environment:
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # GPU variant — activate with: docker compose --profile gpu up
+  plumise-agent-gpu:
+    build: .
+    container_name: plumise-agent-gpu
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    profiles:
+      - gpu
+    volumes:
+      - ./model-cache:/root/.cache/huggingface
+    environment:
+      - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
