@@ -517,13 +517,13 @@ class ModelLoader:
     def _infer_dtype(self) -> torch.dtype:
         """Choose the best dtype for the target device.
 
-        Uses float16 on CPU to enable large-model distributed inference
-        where each node only holds a subset of layers. Quantized models
-        (e.g. MXFP4) keep their native format for quantized modules;
-        this dtype applies only to non-quantized parameters.
+        Uses bfloat16 by default to match MXFP4 dequantization output.
+        Quantized models (e.g. MXFP4) dequantize weights to bfloat16,
+        so non-quantized parameters must also be bfloat16 to avoid
+        dtype mismatches during matmul operations.
         """
         if self._device == "cpu":
-            return torch.float16
+            return torch.bfloat16
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             return torch.bfloat16
         if torch.cuda.is_available():
