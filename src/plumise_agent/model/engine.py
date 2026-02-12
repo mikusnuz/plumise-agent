@@ -293,10 +293,33 @@ class InferenceEngine:
     ) -> torch.Tensor:
         """Pass hidden states through all layers in ``self.parts.layers``.
 
-        Handles different layer calling conventions across model architectures.
+        Computes rotary position embeddings if available and passes them
+        to each layer, supporting modern transformer architectures (Llama,
+        Mistral, GPT-OSS, etc.) that require pre-computed (cos, sin) tensors.
         """
+        # Compute position embeddings once for all layers
+        position_embeddings = None
+        position_ids = None
+        seq_len = hidden_states.shape[1]
+
+        if self.parts.rotary_emb is not None:
+            position_ids = torch.arange(
+                seq_len, dtype=torch.long, device=hidden_states.device
+            ).unsqueeze(0)
+            position_embeddings = self.parts.rotary_emb(
+                hidden_states, position_ids
+            )
+
         for layer in self.parts.layers:
-            layer_output = layer(hidden_states, attention_mask=attention_mask)
+            kwargs: dict[str, Any] = {}
+            if attention_mask is not None:
+                kwargs["attention_mask"] = attention_mask
+            if position_embeddings is not None:
+                kwargs["position_embeddings"] = position_embeddings
+            if position_ids is not None:
+                kwargs["position_ids"] = position_ids
+
+            layer_output = layer(hidden_states, **kwargs)
             # Most layers return a tuple (hidden_states, ...) or just a tensor
             if isinstance(layer_output, tuple):
                 hidden_states = layer_output[0]

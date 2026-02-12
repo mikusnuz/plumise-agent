@@ -31,6 +31,7 @@ class ModelParts:
         layers: The transformer layers assigned to this node.
         norm: Final layer-norm module (last node only, else ``None``).
         lm_head: Language-model head (last node only, else ``None``).
+        rotary_emb: Rotary position embedding module (all nodes need this).
         config: The model's ``PretrainedConfig`` object.
         layer_range: Which layers this node is responsible for.
     """
@@ -39,6 +40,7 @@ class ModelParts:
     layers: torch.nn.ModuleList
     norm: torch.nn.Module | None
     lm_head: torch.nn.Module | None
+    rotary_emb: torch.nn.Module | None
     config: Any
     layer_range: LayerRange
 
@@ -87,6 +89,14 @@ def _get_embedding(body: torch.nn.Module) -> torch.nn.Module:
 def _get_norm(body: torch.nn.Module) -> torch.nn.Module | None:
     """Return the final layer-norm module, or ``None`` if absent."""
     for attr in ("norm", "ln_f", "final_layer_norm", "norm_f"):
+        if hasattr(body, attr):
+            return getattr(body, attr)
+    return None
+
+
+def _get_rotary_emb(body: torch.nn.Module) -> torch.nn.Module | None:
+    """Return the rotary position embedding module, or ``None`` if absent."""
+    for attr in ("rotary_emb", "rotary_pos_emb"):
         if hasattr(body, attr):
             return getattr(body, attr)
     return None
@@ -266,6 +276,7 @@ class ModelLoader:
                 layers=_get_layers(body),
                 norm=_get_norm(body),
                 lm_head=_get_lm_head(model),
+                rotary_emb=_get_rotary_emb(body),
                 config=self._model_config,
                 layer_range=layer_range,
             )
@@ -314,12 +325,14 @@ class ModelLoader:
         embedding = _get_embedding(body) if layer_range.is_first else None
         norm = _get_norm(body) if layer_range.is_last else None
         lm_head = _get_lm_head(model) if layer_range.is_last else None
+        rotary_emb = _get_rotary_emb(body)  # all nodes need rotary embeddings
 
         parts = ModelParts(
             embedding=embedding,
             layers=kept_layers,
             norm=norm,
             lm_head=lm_head,
+            rotary_emb=rotary_emb,
             config=self._model_config,
             layer_range=layer_range,
         )
