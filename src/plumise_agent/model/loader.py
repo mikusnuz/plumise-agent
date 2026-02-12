@@ -238,14 +238,18 @@ class ModelLoader:
         return model, tokenizer
 
     def load_partial(self, layer_range: LayerRange) -> tuple[ModelParts, Any]:
-        """Load the model then discard layers outside ``layer_range``.
+        """Load only the layers assigned to this node via selective device mapping.
 
-        For memory efficiency the full model is loaded first, then
-        unneeded components are deleted and garbage-collected.
+        Instead of loading the full model into RAM and discarding unneeded
+        layers (which requires peak memory equal to the full model size),
+        this method builds a ``device_map`` that materializes only the
+        assigned layers on CPU while keeping everything else as zero-cost
+        meta tensors.  This is critical for distributed inference of large
+        models (e.g. 21B+ params) on memory-constrained nodes.
 
-        - **First node**: keeps embedding + layers[start:end].
-        - **Last node**: keeps layers[start:end] + norm + lm_head.
-        - **Middle node**: keeps only layers[start:end].
+        - **First node**: loads embedding + layers[start:end].
+        - **Last node**: loads layers[start:end] + norm + lm_head.
+        - **Middle node**: loads only layers[start:end].
 
         Args:
             layer_range: Which layers this node owns.
@@ -276,12 +280,22 @@ class ModelLoader:
 
         dtype = self._infer_dtype()
         use_safetensors = self._has_safetensors()
-        # Load the full model on CPU first, then split and move.
-        # low_cpu_mem_usage prevents weight duplication during init,
-        # keeping peak RAM close to 1x model size.
+
+        # Build selective device_map: needed parts -> target device,
+        # everything else -> "meta" (zero memory cost).
+        device_map = self._build_partial_device_map(layer_range)
+        cpu_count = sum(1 for v in device_map.values() if v != "meta")
+        meta_count = sum(1 for v in device_map.values() if v == "meta")
+        logger.info(
+            "Selective device_map: %d modules on device, %d on meta (no memory)",
+            cpu_count,
+            meta_count,
+        )
+
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=dtype,
+            device_map=device_map,
             low_cpu_mem_usage=True,
             token=self.hf_token,
             use_safetensors=use_safetensors,
@@ -291,7 +305,7 @@ class ModelLoader:
         body = _get_model_body(model)
         all_layers = _get_layers(body)
 
-        # Extract the slice of layers we need
+        # Extract only the layers assigned to this node (already on device)
         kept_layers = torch.nn.ModuleList(
             [all_layers[i] for i in range(layer_range.start, layer_range.end)]
         )
@@ -310,18 +324,7 @@ class ModelLoader:
             layer_range=layer_range,
         )
 
-        # Move kept parts to target device
-        device = self._device
-        if device not in ("cpu", "auto"):
-            if parts.embedding is not None:
-                parts.embedding = parts.embedding.to(device)
-            parts.layers = parts.layers.to(device)
-            if parts.norm is not None:
-                parts.norm = parts.norm.to(device)
-            if parts.lm_head is not None:
-                parts.lm_head = parts.lm_head.to(device)
-
-        # Delete the original model to free memory
+        # Delete original model (meta tensors cost nothing to free)
         del model, body, all_layers
         gc.collect()
         if torch.cuda.is_available():
@@ -335,6 +338,80 @@ class ModelLoader:
             parts.lm_head is not None,
         )
         return parts, self._load_tokenizer()
+
+    def _build_partial_device_map(
+        self, layer_range: LayerRange,
+    ) -> dict[str, str]:
+        """Build a ``device_map`` that only materializes needed layers.
+
+        Creates an empty (meta) model to discover the module hierarchy,
+        then maps assigned layers to the target device and everything
+        else to ``"meta"`` (no memory allocated).
+        """
+        from accelerate import init_empty_weights
+
+        with init_empty_weights():
+            empty_model = AutoModelForCausalLM.from_config(self._model_config)
+
+        # Detect architecture paths
+        body_attr = next(
+            a for a in ("model", "transformer", "gpt_neox")
+            if hasattr(empty_model, a)
+        )
+        body = getattr(empty_model, body_attr)
+
+        layers_attr = next(
+            a for a in ("layers", "h", "block")
+            if hasattr(body, a)
+        )
+        embed_attr = next(
+            a for a in ("embed_tokens", "wte", "word_embeddings", "embed_in")
+            if hasattr(body, a)
+        )
+
+        target = self._device  # already resolved (cpu/cuda/mps)
+
+        device_map: dict[str, str] = {}
+
+        # Embedding: first node only
+        device_map[f"{body_attr}.{embed_attr}"] = (
+            target if layer_range.is_first else "meta"
+        )
+
+        # Transformer layers
+        for i in range(layer_range.total):
+            key = f"{body_attr}.{layers_attr}.{i}"
+            device_map[key] = (
+                target if layer_range.start <= i < layer_range.end else "meta"
+            )
+
+        # Remaining body children (norm, rotary_emb, etc.)
+        norm_names = {"norm", "ln_f", "final_layer_norm", "norm_f"}
+        for child_name, _ in body.named_children():
+            full_key = f"{body_attr}.{child_name}"
+            if full_key not in device_map:
+                if child_name in norm_names:
+                    device_map[full_key] = (
+                        target if layer_range.is_last else "meta"
+                    )
+                else:
+                    # Tiny modules (e.g. rotary_emb) always on device
+                    device_map[full_key] = target
+
+        # Top-level children outside body (lm_head, etc.)
+        head_names = {"lm_head", "embed_out"}
+        for child_name, _ in empty_model.named_children():
+            if child_name != body_attr and child_name not in device_map:
+                if child_name in head_names:
+                    device_map[child_name] = (
+                        target if layer_range.is_last else "meta"
+                    )
+                else:
+                    device_map[child_name] = target
+
+        del empty_model
+
+        return device_map
 
     # ---- Private helpers ----
 
