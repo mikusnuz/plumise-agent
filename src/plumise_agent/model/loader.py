@@ -102,6 +102,30 @@ def _get_rotary_emb(body: torch.nn.Module) -> torch.nn.Module | None:
     return None
 
 
+def _remove_hooks(*modules: torch.nn.Module | torch.nn.ModuleList | None) -> None:
+    """Remove accelerate hooks from extracted modules.
+
+    After ``from_pretrained(..., device_map=...)`` accelerate attaches
+    ``AlignDevicesHook`` to every module.  These hooks can trigger
+    ``torch.autocast`` on unsupported device types (e.g. meta tensors)
+    which causes runtime errors.  Since we manage device placement
+    ourselves after extraction, the hooks are no longer needed.
+    """
+    try:
+        from accelerate.hooks import remove_hook_from_module
+    except ImportError:
+        return
+
+    for mod in modules:
+        if mod is None:
+            continue
+        if isinstance(mod, torch.nn.ModuleList):
+            for layer in mod:
+                remove_hook_from_module(layer, recurse=True)
+        else:
+            remove_hook_from_module(mod, recurse=True)
+
+
 def _get_lm_head(model: torch.nn.Module) -> torch.nn.Module | None:
     """Return the language-model head, or ``None`` if absent."""
     for attr in ("lm_head", "embed_out"):
@@ -326,6 +350,9 @@ class ModelLoader:
         norm = _get_norm(body) if layer_range.is_last else None
         lm_head = _get_lm_head(model) if layer_range.is_last else None
         rotary_emb = _get_rotary_emb(body)  # all nodes need rotary embeddings
+
+        # Remove accelerate hooks to avoid autocast issues on CPU
+        _remove_hooks(kept_layers, embedding, norm, lm_head, rotary_emb)
 
         parts = ModelParts(
             embedding=embedding,

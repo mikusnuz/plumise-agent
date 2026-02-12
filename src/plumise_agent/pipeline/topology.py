@@ -97,13 +97,12 @@ class PipelineTopology:
         if not isinstance(data, dict):
             raise ValueError(f"Expected dict from Oracle, got {type(data).__name__}")
 
-        total_layers = data.get("totalLayers", data.get("total_layers", 0))
         raw_nodes = data.get("nodes", [])
 
         nodes: list[NodeSlot] = []
         for i, raw in enumerate(raw_nodes):
             node = NodeSlot(
-                address=raw.get("address", ""),
+                address=raw.get("nodeAddress", raw.get("address", "")),
                 grpc_endpoint=raw.get("grpcEndpoint", raw.get("grpc_endpoint", "")),
                 http_endpoint=raw.get("httpEndpoint", raw.get("http_endpoint", "")),
                 layer_start=raw.get("layerStart", raw.get("layer_start", 0)),
@@ -112,6 +111,11 @@ class PipelineTopology:
                 ready=raw.get("ready", False),
             )
             nodes.append(node)
+
+        # totalLayers: prefer root-level, fallback to max layerEnd from nodes
+        total_layers = data.get("totalLayers", data.get("total_layers", 0))
+        if total_layers == 0 and nodes:
+            total_layers = max(n.layer_end for n in nodes)
 
         # Ensure ordering by pipeline_order
         nodes.sort(key=lambda n: n.pipeline_order)
