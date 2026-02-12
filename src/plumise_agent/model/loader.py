@@ -102,6 +102,48 @@ def _get_rotary_emb(body: torch.nn.Module) -> torch.nn.Module | None:
     return None
 
 
+def _fix_rotary_emb(
+    rotary_emb: torch.nn.Module | None,
+    config: Any,
+    device: str,
+) -> torch.nn.Module | None:
+    """Re-create rotary embedding if it has meta-device buffers.
+
+    ``inv_freq`` is a runtime buffer computed in ``__init__``, **not**
+    stored in the checkpoint.  When loading with ``device_map``, accelerate
+    cannot materialise it from the safetensors file so it stays on the
+    ``meta`` device, causing a ``ValueError`` at forward time.
+
+    The fix: detect meta buffers and, if found, instantiate a fresh
+    ``RotaryEmbedding`` of the same class from the model config.
+    """
+    if rotary_emb is None:
+        return None
+
+    has_meta = any(buf.device.type == "meta" for buf in rotary_emb.buffers())
+    if not has_meta:
+        return rotary_emb
+
+    logger.debug("Rotary embedding has meta buffers; re-creating from config")
+    try:
+        fresh = type(rotary_emb)(config=config)
+        return fresh.to(device)
+    except Exception:
+        # Fallback: manually compute inv_freq for standard RoPE
+        dim = getattr(
+            config, "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        base = getattr(config, "rope_theta", 10000.0)
+        inv_freq = 1.0 / (
+            base
+            ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        )
+        rotary_emb.inv_freq = torch.nn.Parameter(inv_freq, requires_grad=False)
+        logger.debug("Manually reconstructed inv_freq (%d dims) on %s", dim, device)
+        return rotary_emb
+
+
 def _remove_hooks(*modules: torch.nn.Module | torch.nn.ModuleList | None) -> None:
     """Remove accelerate hooks from extracted modules.
 
@@ -349,7 +391,13 @@ class ModelLoader:
         embedding = _get_embedding(body) if layer_range.is_first else None
         norm = _get_norm(body) if layer_range.is_last else None
         lm_head = _get_lm_head(model) if layer_range.is_last else None
-        rotary_emb = _get_rotary_emb(body)  # all nodes need rotary embeddings
+
+        # Rotary embeddings: all nodes need them.  The loaded module may
+        # have meta buffers (inv_freq is a runtime buffer not saved in
+        # safetensors), so we re-create it from config if needed.
+        rotary_emb = _fix_rotary_emb(
+            _get_rotary_emb(body), self._model_config, target,
+        )
 
         # Remove accelerate hooks to avoid autocast issues on CPU
         _remove_hooks(kept_layers, embedding, norm, lm_head, rotary_emb)
