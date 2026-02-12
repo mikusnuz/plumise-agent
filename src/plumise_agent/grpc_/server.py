@@ -92,15 +92,8 @@ class InferencePipelineServicer(inference_pb2_grpc.InferencePipelineServicer):
                 device=self._engine.device,
             )
 
-            # Deserialize attention mask if provided
-            attention_mask = None
-            if request.attention_mask and len(request.attention_mask) > 0:
-                attention_mask = deserialize_tensor(
-                    data=request.attention_mask,
-                    shape=list(request.attention_mask_shape),
-                    dtype="float32",
-                    device=self._engine.device,
-                )
+            # NOTE: attention_mask is no longer passed to engine methods.
+            # Transformer layers construct their own causal mask internally.
 
             metadata = request.metadata
             params = request.params
@@ -114,7 +107,6 @@ class InferencePipelineServicer(inference_pb2_grpc.InferencePipelineServicer):
                 # Last node: generate text
                 text, num_tokens = self._engine.forward_last(
                     hidden_states=hidden_states,
-                    attention_mask=attention_mask,
                     max_new_tokens=params.max_new_tokens or 128,
                     temperature=params.temperature or 0.7,
                     top_p=params.top_p or 0.9,
@@ -136,7 +128,6 @@ class InferencePipelineServicer(inference_pb2_grpc.InferencePipelineServicer):
                 # Middle node: process and potentially forward
                 output_hidden = self._engine.forward_middle(
                     hidden_states=hidden_states,
-                    attention_mask=attention_mask,
                 )
 
                 # Try to forward to next node
@@ -153,7 +144,6 @@ class InferencePipelineServicer(inference_pb2_grpc.InferencePipelineServicer):
                         hidden_states=out_bytes,
                         shape=out_shape,
                         dtype=out_dtype,
-                        attention_mask=request.attention_mask,
                         params=params,
                         metadata=metadata,
                     )
