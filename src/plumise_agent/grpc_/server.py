@@ -104,23 +104,25 @@ class InferencePipelineServicer(inference_pb2_grpc.InferencePipelineServicer):
                 is_last = True
 
             if is_last:
-                # Last node: generate text
-                text, num_tokens = self._engine.forward_last(
+                # Last node: sample a single token (pipeline autoregressive)
+                past_ids = list(request.past_token_ids) if request.past_token_ids else []
+                token_id, is_eos = self._engine.forward_last_token(
                     hidden_states=hidden_states,
-                    max_new_tokens=params.max_new_tokens or 128,
                     temperature=params.temperature or 0.7,
                     top_p=params.top_p or 0.9,
                     repetition_penalty=params.repetition_penalty or 1.2,
                     do_sample=params.do_sample,
+                    past_token_ids=past_ids,
                 )
 
                 latency_ms = (time.perf_counter() - t0) * 1000
-                self._record_metrics(num_tokens, latency_ms)
+                self._record_metrics(1 if not is_eos else 0, latency_ms)
 
                 return inference_pb2.ForwardResponse(
                     request_id=request_id,
-                    generated_text=text,
-                    num_tokens=num_tokens,
+                    next_token_id=token_id,
+                    is_eos=is_eos,
+                    num_tokens=1 if not is_eos else 0,
                     latency_ms=latency_ms,
                     success=True,
                 )

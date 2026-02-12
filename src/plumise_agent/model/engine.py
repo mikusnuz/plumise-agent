@@ -147,6 +147,42 @@ class InferenceEngine:
             return hidden_states
 
     # ------------------------------------------------------------------
+    # First node: forward from pre-tokenized IDs (pipeline autoregressive)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def forward_first_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """First-node forward from pre-tokenized input IDs.
+
+        Used by the pipeline autoregressive loop where the executor
+        manages tokenization and appends generated tokens each iteration.
+
+        Args:
+            input_ids: Token ID tensor of shape ``(batch, seq_len)``.
+
+        Returns:
+            Hidden-states tensor of shape ``(batch, seq_len, hidden_dim)``.
+        """
+        with self._lock:
+            t0 = time.perf_counter()
+
+            input_ids = input_ids.to(self.device)
+
+            if self.parts.embedding is None:
+                raise RuntimeError("forward_first_ids requires an embedding module")
+
+            hidden_states = self.parts.embedding(input_ids)
+            hidden_states = self._run_through_layers(hidden_states)
+
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.debug(
+                "forward_first_ids: shape=%s in %.1f ms",
+                list(hidden_states.shape),
+                elapsed,
+            )
+            return hidden_states
+
+    # ------------------------------------------------------------------
     # Middle node: hidden states -> layers -> hidden states
     # ------------------------------------------------------------------
 
@@ -267,6 +303,71 @@ class InferenceEngine:
                 "forward_last: %d tokens in %.1f ms", num_tokens, elapsed
             )
             return text, num_tokens
+
+    # ------------------------------------------------------------------
+    # Last node: single-token sampling (pipeline autoregressive)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def forward_last_token(
+        self,
+        hidden_states: torch.Tensor,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.2,
+        do_sample: bool = True,
+        past_token_ids: list[int] | None = None,
+    ) -> tuple[int, bool]:
+        """Last-node forward: sample exactly one token from hidden states.
+
+        Used by the pipeline autoregressive loop. Runs hidden states through
+        the remaining layers, applies norm, then samples a single token from
+        the lm_head logits.
+
+        Args:
+            hidden_states: Input tensor from the previous node.
+            temperature: Sampling temperature.
+            top_p: Nucleus sampling threshold.
+            repetition_penalty: Penalty for repeating tokens.
+            do_sample: Whether to sample (``False`` for greedy).
+            past_token_ids: Previously generated token IDs for repetition penalty.
+
+        Returns:
+            ``(token_id, is_eos)`` tuple.
+        """
+        with self._lock:
+            hidden_states = hidden_states.to(self.device)
+
+            if self.parts.lm_head is None:
+                raise RuntimeError("forward_last_token requires a lm_head module")
+
+            # Run through remaining layers
+            hidden_states = self._run_through_layers(hidden_states)
+
+            # Apply final layer norm
+            if self.parts.norm is not None:
+                hidden_states = self.parts.norm(hidden_states)
+
+            # Get logits for the last position only
+            logits = self.parts.lm_head(hidden_states[:, -1:, :])
+            logits = logits[:, -1, :]  # (batch, vocab)
+
+            # Apply repetition penalty
+            if repetition_penalty != 1.0 and past_token_ids:
+                logits = self._apply_repetition_penalty(
+                    logits, past_token_ids, repetition_penalty
+                )
+
+            # Sample next token
+            token_id = self._sample_token(
+                logits,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=do_sample,
+            )
+
+            is_eos = token_id == self.tokenizer.eos_token_id
+            return token_id, is_eos
 
     # ------------------------------------------------------------------
     # Internal helpers

@@ -90,6 +90,7 @@ class PipelineClient:
         attention_mask_shape: list[int] | None = None,
         params: Any | None = None,
         metadata: Any | None = None,
+        past_token_ids: list[int] | None = None,
     ) -> Any:
         """Send hidden states to the next node for processing.
 
@@ -102,6 +103,7 @@ class PipelineClient:
             attention_mask_shape: Shape of the attention mask tensor.
             params: ``GenerationParams`` protobuf message (forwarded as-is).
             metadata: ``PipelineMetadata`` protobuf message (forwarded as-is).
+            past_token_ids: Previously generated token IDs for repetition penalty.
 
         Returns:
             ``ForwardResponse`` protobuf message from the target node.
@@ -126,6 +128,9 @@ class PipelineClient:
 
         if metadata is not None:
             request.metadata.CopyFrom(metadata)
+
+        if past_token_ids:
+            request.past_token_ids.extend(past_token_ids)
 
         logger.debug(
             "Forwarding request %s to %s (shape=%s, dtype=%s)",

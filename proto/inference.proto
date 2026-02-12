@@ -38,6 +38,9 @@ message ForwardRequest {
 
   // Pipeline metadata.
   PipelineMetadata metadata = 8;
+
+  // Past generated token IDs for repetition penalty (pipeline autoregressive).
+  repeated int32 past_token_ids = 9;
 }
 
 message ForwardResponse {
@@ -58,6 +61,10 @@ message ForwardResponse {
   // Error info.
   bool success = 8;
   string error = 9;
+
+  // Single sampled token (pipeline autoregressive mode).
+  int32 next_token_id = 10;
+  bool is_eos = 11;
 }
 
 message TokenChunk {

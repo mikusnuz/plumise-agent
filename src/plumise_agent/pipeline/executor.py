@@ -8,8 +8,11 @@ to initiate a distributed pipeline across multiple gRPC-connected nodes.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import TYPE_CHECKING
+
+import torch
 
 from plumise_agent.grpc_.client import PipelineClient
 from plumise_agent.grpc_.serializer import serialize_tensor
@@ -145,30 +148,32 @@ class PipelineExecutor:
         params: dict,
         request_id: str,
     ) -> tuple[str, int]:
-        """Execute the full distributed pipeline starting from this (first) node.
+        """Execute distributed autoregressive generation across pipeline nodes.
 
-        Steps:
-          1. Run ``forward_first()`` to embed and process through local layers.
-          2. Serialize the resulting hidden states.
-          3. Build the gRPC ``ForwardRequest`` with generation params and
-             pipeline metadata.
-          4. Send to the next node via ``PipelineClient``.
-          5. If the response contains ``generated_text``, return it.
-             Otherwise propagate to the next node (handled server-side).
+        Manages the generation loop from the first node:
+          1. Tokenize the prompt.
+          2. For each token to generate:
+             a. Embed + run through local layers (``forward_first_ids``).
+             b. Serialize hidden states and send to next node via gRPC.
+             c. Next node runs remaining layers + samples one token.
+             d. Append token to input, repeat.
+          3. Decode all generated tokens and return the text.
         """
+        t0 = time.perf_counter()
+        max_new_tokens = params.get("max_new_tokens", 128)
+
         logger.info(
-            "Executing pipeline inference: request_id=%s nodes=%d",
+            "Pipeline autoregressive generation: request_id=%s max_tokens=%d nodes=%d",
             request_id,
+            max_new_tokens,
             len(self._topology.nodes),
         )
 
-        # Step 1: First-node forward pass
-        hidden_states = self._engine.forward_first(prompt)
+        # Tokenize the prompt
+        inputs = self._engine.tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(self._engine.device)
 
-        # Step 2: Serialize
-        hs_bytes, hs_shape, hs_dtype = serialize_tensor(hidden_states)
-
-        # Step 3: Find the next node
+        # Find the next node
         next_node = self._topology.get_next_node(self._my_order)
         if next_node is None:
             raise RuntimeError(
@@ -176,51 +181,74 @@ class PipelineExecutor:
                 f"{self._my_order}, but this is not the last node."
             )
 
-        # Build generation params protobuf
+        # Build generation params and metadata (reused each iteration)
         gen_params = self._build_gen_params(params)
-
-        # Build pipeline metadata
         metadata = self._build_metadata(prompt, request_id)
 
-        # Step 4: Forward to next node
+        # Reuse a single gRPC client across the entire generation loop
         client = PipelineClient(
             target=next_node.grpc_endpoint,
-            timeout=min(120.0, max(60.0, params.get("max_new_tokens", 128) * 0.5)),
+            timeout=30.0,
         )
 
+        generated_tokens: list[int] = []
+
         try:
-            response = await client.forward(
-                request_id=request_id,
-                hidden_states=hs_bytes,
-                shape=hs_shape,
-                dtype=hs_dtype,
-                params=gen_params,
-                metadata=metadata,
-            )
+            for step in range(max_new_tokens):
+                # Step 1: Embed + local layers
+                hidden_states = self._engine.forward_first_ids(input_ids)
+
+                # Step 2: Serialize and send to next node
+                hs_bytes, hs_shape, hs_dtype = serialize_tensor(hidden_states)
+
+                response = await client.forward(
+                    request_id=f"{request_id}_s{step}",
+                    hidden_states=hs_bytes,
+                    shape=hs_shape,
+                    dtype=hs_dtype,
+                    params=gen_params,
+                    metadata=metadata,
+                    past_token_ids=generated_tokens,
+                )
+
+                if not response.success:
+                    raise RuntimeError(
+                        f"Pipeline forward failed at step {step}: {response.error}"
+                    )
+
+                # Step 3: Check for EOS
+                if response.is_eos:
+                    logger.debug("EOS received at step %d", step)
+                    break
+
+                # Step 4: Append token and continue
+                token_id = response.next_token_id
+                generated_tokens.append(token_id)
+
+                next_token = torch.tensor(
+                    [[token_id]], dtype=torch.long, device=self._engine.device
+                )
+                input_ids = torch.cat([input_ids, next_token], dim=1)
+
         finally:
             await client.close()
 
-        # Step 5: Check response
-        if not response.success:
-            raise RuntimeError(
-                f"Pipeline forward failed at node {next_node.address}: "
-                f"{response.error}"
-            )
-
-        if response.generated_text:
-            logger.info(
-                "Pipeline inference complete: request_id=%s tokens=%d",
-                request_id,
-                response.num_tokens,
-            )
-            return response.generated_text, response.num_tokens
-
-        # If the response contains hidden states but no text, something
-        # went wrong in the pipeline chain (middle node didn't forward).
-        raise RuntimeError(
-            "Pipeline returned hidden states instead of generated text. "
-            "This likely means the last node could not be reached."
+        # Decode all generated tokens
+        text = self._engine.tokenizer.decode(
+            generated_tokens, skip_special_tokens=True
         )
+        num_tokens = len(generated_tokens)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        logger.info(
+            "Pipeline generation complete: request_id=%s tokens=%d latency=%.0fms (%.1f tok/s)",
+            request_id,
+            num_tokens,
+            elapsed_ms,
+            num_tokens / (elapsed_ms / 1000) if elapsed_ms > 0 else 0,
+        )
+
+        return text, num_tokens
 
     # ------------------------------------------------------------------
     # Protobuf builders
