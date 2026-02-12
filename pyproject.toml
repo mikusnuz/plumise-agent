@@ -14,7 +14,7 @@ authors = [{name = "Plumise Team"}]
 dependencies = [
     # ML / Inference
     "torch>=2.2",
-    "transformers>=4.40",
+    "transformers>=4.55",
     "accelerate>=0.28",
     "safetensors",
     "sentencepiece",

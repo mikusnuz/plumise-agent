@@ -224,6 +224,7 @@ class ModelLoader:
             self.model_name,
             torch_dtype=dtype,
             device_map=self._device if self._device != "cpu" else None,
+            low_cpu_mem_usage=True,
             token=self.hf_token,
             use_safetensors=use_safetensors,
         )
@@ -275,10 +276,13 @@ class ModelLoader:
 
         dtype = self._infer_dtype()
         use_safetensors = self._has_safetensors()
-        # Load the full model on CPU first, then split and move
+        # Load the full model on CPU first, then split and move.
+        # low_cpu_mem_usage prevents weight duplication during init,
+        # keeping peak RAM close to 1x model size.
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=dtype,
+            low_cpu_mem_usage=True,
             token=self.hf_token,
             use_safetensors=use_safetensors,
         )
@@ -346,15 +350,21 @@ class ModelLoader:
         return tokenizer
 
     def _infer_dtype(self) -> torch.dtype:
-        """Choose the best dtype for the target device."""
+        """Choose the best dtype for the target device.
+
+        Uses float16 on CPU to enable large-model distributed inference
+        where each node only holds a subset of layers. Quantized models
+        (e.g. MXFP4) keep their native format for quantized modules;
+        this dtype applies only to non-quantized parameters.
+        """
         if self._device == "cpu":
-            return torch.float32
+            return torch.float16
         if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             return torch.bfloat16
         if torch.cuda.is_available():
             return torch.float16
         # MPS or other accelerators
-        return torch.float32
+        return torch.float16
 
     def _has_safetensors(self) -> bool:
         """Check if the model has safetensors format available."""
