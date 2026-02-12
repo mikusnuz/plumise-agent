@@ -128,7 +128,8 @@ class PlumiseAuth:
         """
         msg = encode_defunct(text=message)
         signed = self.account.sign_message(msg)
-        return signed.signature.hex()
+        sig_hex = signed.signature.hex()
+        return sig_hex if sig_hex.startswith("0x") else "0x" + sig_hex
 
     def sign_payload(self, payload: dict[str, Any]) -> str:
         """Deterministically sign a JSON payload.

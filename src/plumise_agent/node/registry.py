@@ -7,6 +7,7 @@ fetches the current pipeline topology for inter-node routing.
 
 from __future__ import annotations
 
+import json
 import logging
 import socket
 import time
@@ -59,24 +60,31 @@ class OracleRegistry:
         ram_mb, vram_mb, device = self._detect_hardware()
 
         timestamp = int(time.time())
-        message = f"register:{self.auth.address}:{self.config.model_name}:{timestamp}"
-        signature = self.auth.sign_message(message)
+        grpc_endpoint = (
+            self.config.grpc_endpoint
+            or f"http://{self._get_local_ip()}:{self.config.grpc_port}"
+        )
+        http_endpoint = (
+            self.config.node_endpoint
+            or f"http://{self._get_local_ip()}:{self.config.api_port}"
+        )
 
-        payload = {
+        # Sign JSON message matching Oracle's verifyRegistrationSignature format
+        sign_data = {
             "address": self.auth.address,
-            "grpcEndpoint": (
-                self.config.grpc_endpoint
-                or f"{self._get_local_ip()}:{self.config.grpc_port}"
-            ),
-            "httpEndpoint": (
-                self.config.node_endpoint
-                or f"http://{self._get_local_ip()}:{self.config.api_port}"
-            ),
+            "grpcEndpoint": grpc_endpoint,
+            "httpEndpoint": http_endpoint,
             "model": self.config.model_name,
             "ramMb": ram_mb,
             "device": device,
             "vramMb": vram_mb,
             "timestamp": timestamp,
+        }
+        message = json.dumps(sign_data, separators=(",", ":"))
+        signature = self.auth.sign_message(message)
+
+        payload = {
+            **sign_data,
             "signature": signature,
         }
 
@@ -122,13 +130,17 @@ class OracleRegistry:
             ``True`` on success, ``False`` otherwise.
         """
         timestamp = int(time.time())
-        message = f"ready:{self.auth.address}:{self.config.model_name}:{timestamp}"
-        signature = self.auth.sign_message(message)
-
-        payload = {
+        # Sign JSON message matching Oracle's verifyReadySignature format
+        sign_data = {
             "address": self.auth.address,
             "model": self.config.model_name,
             "timestamp": timestamp,
+        }
+        message = json.dumps(sign_data, separators=(",", ":"))
+        signature = self.auth.sign_message(message)
+
+        payload = {
+            **sign_data,
             "signature": signature,
         }
 

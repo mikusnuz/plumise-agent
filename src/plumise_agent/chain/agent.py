@@ -112,7 +112,7 @@ class ChainAgent:
 
             # Sign and send
             signed = self.account.sign_transaction(tx)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
             logger.info("Agent registration tx sent: %s", tx_hash.hex())
 
@@ -164,7 +164,7 @@ class ChainAgent:
 
             # Sign and send
             signed = self.account.sign_transaction(tx)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
             logger.debug("Heartbeat tx sent: %s", tx_hash.hex())
 
@@ -216,7 +216,7 @@ class ChainAgent:
             }
 
             signed = self.account.sign_transaction(tx)
-            tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+            tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
 
             logger.info(
                 "verifyInference tx sent: %s (tokens=%d)",
