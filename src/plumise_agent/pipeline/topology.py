@@ -101,9 +101,16 @@ class PipelineTopology:
 
         nodes: list[NodeSlot] = []
         for i, raw in enumerate(raw_nodes):
+            # gRPC endpoints must be "host:port" without scheme prefix
+            grpc_ep = raw.get("grpcEndpoint", raw.get("grpc_endpoint", ""))
+            for scheme in ("http://", "https://"):
+                if grpc_ep.startswith(scheme):
+                    grpc_ep = grpc_ep[len(scheme):]
+                    break
+
             node = NodeSlot(
                 address=raw.get("nodeAddress", raw.get("address", "")),
-                grpc_endpoint=raw.get("grpcEndpoint", raw.get("grpc_endpoint", "")),
+                grpc_endpoint=grpc_ep,
                 http_endpoint=raw.get("httpEndpoint", raw.get("http_endpoint", "")),
                 layer_start=raw.get("layerStart", raw.get("layer_start", 0)),
                 layer_end=raw.get("layerEnd", raw.get("layer_end", 0)),
