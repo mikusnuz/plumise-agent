@@ -130,17 +130,15 @@ class InferenceEngine:
 
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
             input_ids = inputs["input_ids"]
-            attention_mask = inputs.get("attention_mask")
 
             if self.parts.embedding is None:
                 raise RuntimeError("forward_first requires an embedding module")
 
             hidden_states = self.parts.embedding(input_ids)
 
-            # Prepare causal mask / position ids if needed
-            hidden_states = self._run_through_layers(
-                hidden_states, attention_mask=attention_mask
-            )
+            # Do NOT pass the tokenizer's 2D attention_mask to layers;
+            # transformer layers generate their own causal mask internally.
+            hidden_states = self._run_through_layers(hidden_states)
 
             elapsed = (time.perf_counter() - t0) * 1000
             logger.debug(
@@ -156,13 +154,11 @@ class InferenceEngine:
     def forward_middle(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Middle-node forward: process hidden states through assigned layers.
 
         Args:
             hidden_states: Input tensor from the previous node.
-            attention_mask: Optional attention mask.
 
         Returns:
             Processed hidden-states tensor.
@@ -171,12 +167,8 @@ class InferenceEngine:
             t0 = time.perf_counter()
 
             hidden_states = hidden_states.to(self.device)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(self.device)
 
-            hidden_states = self._run_through_layers(
-                hidden_states, attention_mask=attention_mask
-            )
+            hidden_states = self._run_through_layers(hidden_states)
 
             elapsed = (time.perf_counter() - t0) * 1000
             logger.debug(
@@ -194,7 +186,6 @@ class InferenceEngine:
     def forward_last(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
         max_new_tokens: int = 128,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -205,7 +196,6 @@ class InferenceEngine:
 
         Args:
             hidden_states: Input tensor from the previous node.
-            attention_mask: Optional attention mask.
             max_new_tokens: Maximum number of tokens to generate.
             temperature: Sampling temperature.
             top_p: Nucleus sampling threshold.
@@ -219,16 +209,12 @@ class InferenceEngine:
             t0 = time.perf_counter()
 
             hidden_states = hidden_states.to(self.device)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(self.device)
 
             if self.parts.lm_head is None:
                 raise RuntimeError("forward_last requires a lm_head module")
 
             # Run through remaining layers
-            hidden_states = self._run_through_layers(
-                hidden_states, attention_mask=attention_mask
-            )
+            hidden_states = self._run_through_layers(hidden_states)
 
             # Apply final layer norm
             if self.parts.norm is not None:
@@ -289,13 +275,17 @@ class InferenceEngine:
     def _run_through_layers(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Pass hidden states through all layers in ``self.parts.layers``.
 
         Computes rotary position embeddings if available and passes them
         to each layer, supporting modern transformer architectures (Llama,
         Mistral, GPT-OSS, etc.) that require pre-computed (cos, sin) tensors.
+
+        Note: We do NOT pass an explicit attention_mask. The tokenizer
+        produces a 2D mask (batch, seq_len), but transformer layers expect
+        a 4D causal mask. By omitting it, each layer constructs its own
+        causal mask internally (which is correct for decoder-only models).
         """
         # Compute position embeddings once for all layers
         position_embeddings = None
@@ -312,8 +302,6 @@ class InferenceEngine:
 
         for layer in self.parts.layers:
             kwargs: dict[str, Any] = {}
-            if attention_mask is not None:
-                kwargs["attention_mask"] = attention_mask
             if position_embeddings is not None:
                 kwargs["position_embeddings"] = position_embeddings
             if position_ids is not None:
