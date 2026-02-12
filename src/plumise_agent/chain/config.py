@@ -123,6 +123,32 @@ class AgentConfig(BaseSettings):
         description="Public gRPC endpoint for this node (e.g. 1.2.3.4:50051)",
     )
 
+    # ---- Security: gRPC TLS ----
+    grpc_tls_cert: str = Field(
+        default="",
+        description="Path to TLS certificate for gRPC (PEM). Empty = insecure.",
+    )
+    grpc_tls_key: str = Field(
+        default="",
+        description="Path to TLS private key for gRPC (PEM).",
+    )
+    grpc_tls_ca: str = Field(
+        default="",
+        description="Path to CA certificate for gRPC mTLS client verification (PEM).",
+    )
+
+    # ---- Security: API auth ----
+    api_secret: str = Field(
+        default="",
+        description="Shared secret for Bearer token API auth. Empty = no auth.",
+    )
+
+    # ---- Security: Model integrity ----
+    model_hash: str = Field(
+        default="",
+        description="Expected SHA-256 hash of model config.json for integrity check.",
+    )
+
     # ---- Inference proof ----
     verify_on_chain: bool = Field(
         default=False,

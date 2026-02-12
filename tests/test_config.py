@@ -211,20 +211,14 @@ class TestLoadAbi:
         abi_file = tmp_path / "TestContract.json"
         abi_file.write_text(json.dumps(abi_list))
 
-        with patch.object(
-            type(AgentConfig),
-            "__dict__",
-            {**type(AgentConfig).__dict__},
-        ):
-            # Patch the contracts directory to our temp dir
-            import plumise_agent.chain.config as config_mod
-            original = config_mod._CONTRACTS_DIR
-            config_mod._CONTRACTS_DIR = tmp_path
-            try:
-                result = AgentConfig.load_abi("TestContract")
-                assert result == abi_list
-            finally:
-                config_mod._CONTRACTS_DIR = original
+        import plumise_agent.chain.config as config_mod
+        original = config_mod._CONTRACTS_DIR
+        config_mod._CONTRACTS_DIR = tmp_path
+        try:
+            result = AgentConfig.load_abi("TestContract")
+            assert result == abi_list
+        finally:
+            config_mod._CONTRACTS_DIR = original
 
     def test_load_abi_wrapper_object(self, tmp_path: Path):
         """When the JSON has an ``abi`` key, extract that."""

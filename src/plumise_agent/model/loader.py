@@ -8,8 +8,10 @@ assigned to this node).
 from __future__ import annotations
 
 import gc
+import hashlib
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -116,15 +118,21 @@ class ModelLoader:
         model_name: str,
         device: str = "auto",
         hf_token: str = "",
+        expected_hash: str = "",
     ) -> None:
         self.model_name = model_name
         self.hf_token = hf_token or None  # transformers treats None as "no token"
         self._device = self._resolve_device(device)
+        self._expected_hash = expected_hash
 
         self._model_config = AutoConfig.from_pretrained(
             model_name,
             token=self.hf_token,
         )
+
+        # Verify model config integrity if hash provided
+        if expected_hash:
+            self._verify_config_hash(expected_hash)
 
         logger.info(
             "ModelLoader initialized: model=%s device=%s total_layers=%d",
@@ -144,20 +152,80 @@ class ModelLoader:
             f"Cannot determine layer count from config: {type(self._model_config).__name__}"
         )
 
+    def _verify_config_hash(self, expected_hash: str) -> None:
+        """Verify model config.json SHA-256 against expected hash.
+
+        Checks the cached config.json file to detect tampering.
+        """
+        try:
+            from huggingface_hub import hf_hub_download
+
+            config_path = hf_hub_download(
+                self.model_name, "config.json", token=self.hf_token,
+            )
+            actual_hash = hashlib.sha256(
+                Path(config_path).read_bytes()
+            ).hexdigest()
+
+            if actual_hash != expected_hash:
+                logger.error(
+                    "MODEL INTEGRITY FAILURE: config.json hash mismatch! "
+                    "expected=%s actual=%s",
+                    expected_hash[:16] + "...",
+                    actual_hash[:16] + "...",
+                )
+                raise ValueError(
+                    f"Model config integrity check failed: "
+                    f"expected {expected_hash}, got {actual_hash}"
+                )
+            logger.info("Model config integrity verified (SHA-256 OK)")
+        except ImportError:
+            logger.warning("huggingface_hub not available; skipping integrity check")
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.warning("Could not verify model hash: %s", exc)
+
+    @staticmethod
+    def _check_cache_permissions(model_name: str) -> None:
+        """Check that model cache directory isn't world-writable."""
+        import os
+        import stat as stat_mod
+
+        hf_home = os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+        cache_dir = Path(hf_home) / "hub"
+        if cache_dir.exists():
+            mode = cache_dir.stat().st_mode
+            if mode & stat_mod.S_IWOTH:
+                logger.warning(
+                    "HuggingFace cache %s is world-writable (mode=%s). "
+                    "This is a security risk.",
+                    cache_dir, oct(mode)[-3:],
+                )
+
     def load_full(self) -> tuple[torch.nn.Module, Any]:
         """Load the complete model and tokenizer.
+
+        Prefers ``safetensors`` format when available to avoid
+        ``pickle`` deserialization risks.
 
         Returns:
             ``(model, tokenizer)`` tuple.
         """
         logger.info("Loading full model: %s", self.model_name)
+        self._check_cache_permissions(self.model_name)
 
         dtype = self._infer_dtype()
+
+        # Try safetensors first (avoids pickle-based torch.load)
+        use_safetensors = self._has_safetensors()
+
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=dtype,
             device_map=self._device if self._device != "cpu" else None,
             token=self.hf_token,
+            use_safetensors=use_safetensors,
         )
         if self._device == "cpu":
             model = model.to("cpu")
@@ -206,11 +274,13 @@ class ModelLoader:
         )
 
         dtype = self._infer_dtype()
+        use_safetensors = self._has_safetensors()
         # Load the full model on CPU first, then split and move
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=dtype,
             token=self.hf_token,
+            use_safetensors=use_safetensors,
         )
         model.eval()
 
@@ -285,6 +355,25 @@ class ModelLoader:
             return torch.float16
         # MPS or other accelerators
         return torch.float32
+
+    def _has_safetensors(self) -> bool:
+        """Check if the model has safetensors format available."""
+        try:
+            from huggingface_hub import model_info
+
+            info = model_info(self.model_name, token=self.hf_token)
+            filenames = [s.rfilename for s in (info.siblings or [])]
+            has_st = any(f.endswith(".safetensors") for f in filenames)
+            if has_st:
+                logger.info("Using safetensors format (secure, no pickle)")
+            else:
+                logger.warning(
+                    "safetensors not available for %s; falling back to pickle-based loading",
+                    self.model_name,
+                )
+            return has_st
+        except Exception:
+            return False  # fallback to default
 
     @staticmethod
     def _resolve_device(device: str) -> str:

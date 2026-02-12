@@ -6,8 +6,12 @@ participating in the distributed inference network.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
+import os
+import stat
+from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
 from eth_account import Account
@@ -45,9 +49,16 @@ class PlumiseAuth:
             config.plumise_rpc_url,
             request_kwargs={"timeout": 30},
         ))
+
+        # Check .env file permissions (warn if world-readable)
+        self._check_env_permissions()
+
         self.account = Account.from_key(config.plumise_private_key)
         self.address: str = self.account.address
         self.chain_id: int = config.plumise_chain_id
+
+        # Scrub private key from config string after Account creation
+        self._scrub_key(config)
 
         self._registry: Optional[Contract] = None
         if config.agent_registry_address:
@@ -58,6 +69,47 @@ class PlumiseAuth:
             )
 
         logger.info("PlumiseAuth initialized for %s (chain %d)", self.address, self.chain_id)
+
+    @staticmethod
+    def _scrub_key(config: PlumiseConfig) -> None:
+        """Best-effort scrub of the private key string from memory.
+
+        Python strings are immutable and interned, so this is not
+        cryptographically guaranteed. The Account object retains the
+        key internally for signing, but at least we remove the
+        easily-accessible config reference.
+        """
+        try:
+            key_str = config.plumise_private_key
+            if key_str:
+                # Overwrite the string buffer via ctypes (CPython only)
+                buf = ctypes.create_string_buffer(len(key_str))
+                ctypes.memmove(id(key_str) + 49, buf, len(key_str))
+            # Replace the config field with a sentinel
+            object.__setattr__(config, "plumise_private_key", "[SCRUBBED]")
+        except Exception:
+            # Non-fatal: pydantic frozen model or non-CPython runtime
+            try:
+                object.__setattr__(config, "plumise_private_key", "[SCRUBBED]")
+            except Exception:
+                pass
+
+    @staticmethod
+    def _check_env_permissions() -> None:
+        """Warn if .env file is world-readable."""
+        env_path = Path(".env")
+        if not env_path.exists():
+            return
+        try:
+            mode = env_path.stat().st_mode
+            if mode & stat.S_IROTH:
+                logger.warning(
+                    ".env is world-readable (mode=%s). "
+                    "Run: chmod 600 .env",
+                    oct(mode)[-3:],
+                )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Chain verification

@@ -3,27 +3,32 @@
 Exposes REST endpoints consumed by the plumise-inference-api gateway
 and by monitoring tools:
 
-- ``GET  /health``               -- readiness check
-- ``POST /api/v1/generate``      -- text generation (single-node or pipeline)
-- ``GET  /api/v1/pipeline/status`` -- current pipeline topology
-- ``GET  /api/v1/metrics``       -- inference metrics snapshot
+- ``GET  /health``               -- readiness check (public)
+- ``POST /api/v1/generate``      -- text generation (auth required)
+- ``GET  /api/v1/pipeline/status`` -- pipeline topology (auth required)
+- ``GET  /api/v1/metrics``       -- inference metrics (auth required)
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from plumise_agent.node.node import PlumiseAgent
 
 logger = logging.getLogger(__name__)
+
+# Optional auth scheme (auto_error=False so unauthenticated requests get a clear 401)
+_bearer_scheme = HTTPBearer(auto_error=False)
 
 
 # ---------------------------------------------------------------------------
@@ -77,15 +82,26 @@ def create_app(agent: PlumiseAgent) -> FastAPI:
         description="Distributed LLM inference node for the Plumise chain.",
     )
 
+    api_secret: str = agent.config.api_secret
+
+    # ----- Auth dependency ------------------------------------------------
+
+    async def require_auth(
+        credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+    ) -> None:
+        """Verify Bearer token if API_SECRET is configured."""
+        if not api_secret:
+            return  # auth disabled
+        if credentials is None:
+            raise HTTPException(status_code=401, detail="Authorization header required")
+        if not hmac.compare_digest(credentials.credentials, api_secret):
+            raise HTTPException(status_code=403, detail="Invalid token")
+
     # ----- Health ---------------------------------------------------------
 
     @app.get("/health")
     async def health() -> dict:
-        """Readiness check.
-
-        Returns ``"ok"`` once the model is loaded and the engine is
-        ready, or ``"loading"`` while setup is in progress.
-        """
+        """Readiness check (public, no auth)."""
         ready = agent.engine is not None
         mode = "single"
         if agent.layer_range and not agent.layer_range.is_full:
@@ -110,15 +126,13 @@ def create_app(agent: PlumiseAgent) -> FastAPI:
 
     # ----- Generate -------------------------------------------------------
 
-    @app.post("/api/v1/generate", response_model=GenerateResponse)
+    @app.post(
+        "/api/v1/generate",
+        response_model=GenerateResponse,
+        dependencies=[Depends(require_auth)],
+    )
     async def generate(request: GenerateRequest) -> GenerateResponse:
-        """Generate text from a prompt.
-
-        If the node holds all layers (single-node mode) the engine
-        runs the full generation locally.  In pipeline mode the request
-        is handled by the ``PipelineExecutor`` which coordinates with
-        upstream/downstream nodes via gRPC.
-        """
+        """Generate text from a prompt (auth required)."""
         if agent.engine is None:
             raise HTTPException(status_code=503, detail="Model is still loading")
 
@@ -186,7 +200,7 @@ def create_app(agent: PlumiseAgent) -> FastAPI:
 
     # ----- Pipeline Status ------------------------------------------------
 
-    @app.get("/api/v1/pipeline/status")
+    @app.get("/api/v1/pipeline/status", dependencies=[Depends(require_auth)])
     async def pipeline_status() -> dict:
         """Return the current pipeline topology and this node's position."""
         result: dict = {
@@ -214,11 +228,16 @@ def create_app(agent: PlumiseAgent) -> FastAPI:
 
     # ----- Metrics --------------------------------------------------------
 
-    @app.get("/api/v1/metrics")
+    @app.get("/api/v1/metrics", dependencies=[Depends(require_auth)])
     async def metrics() -> dict:
-        """Return a snapshot of inference metrics."""
+        """Return a snapshot of inference metrics (auth required)."""
         snapshot = agent.metrics.get_snapshot()
         return snapshot.to_dict()
+
+    if api_secret:
+        logger.info("API authentication enabled (Bearer token)")
+    else:
+        logger.warning("API authentication DISABLED (no API_SECRET configured)")
 
     return app
 

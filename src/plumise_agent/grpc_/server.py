@@ -244,12 +244,43 @@ class InferencePipelineServicer(inference_pb2_grpc.InferencePipelineServicer):
 # Server factory
 # ---------------------------------------------------------------------------
 
+def _load_tls_credentials(
+    cert_path: str,
+    key_path: str,
+    ca_path: str = "",
+) -> grpc.ServerCredentials:
+    """Load TLS credentials from PEM files.
+
+    Args:
+        cert_path: Path to server certificate PEM.
+        key_path: Path to server private key PEM.
+        ca_path: Optional path to CA certificate for mTLS client verification.
+
+    Returns:
+        gRPC ``ServerCredentials`` instance.
+    """
+    from pathlib import Path
+
+    cert = Path(cert_path).read_bytes()
+    key = Path(key_path).read_bytes()
+    root_ca = Path(ca_path).read_bytes() if ca_path else None
+
+    return grpc.ssl_server_credentials(
+        private_key_certificate_chain_pairs=[(key, cert)],
+        root_certificates=root_ca,
+        require_client_auth=bool(root_ca),
+    )
+
+
 async def start_grpc_server(
     servicer: InferencePipelineServicer,
     host: str = "0.0.0.0",
     port: int = 50051,
     max_workers: int = 4,
     max_message_length: int = 256 * 1024 * 1024,  # 256 MiB
+    tls_cert: str = "",
+    tls_key: str = "",
+    tls_ca: str = "",
 ) -> grpc_aio.Server:
     """Create, configure, and start an async gRPC server.
 
@@ -260,6 +291,9 @@ async def start_grpc_server(
         max_workers: Maximum number of concurrent RPC handlers.
         max_message_length: Maximum message size in bytes (default 256 MiB,
             needed for large hidden-state tensors).
+        tls_cert: Path to TLS certificate PEM. Empty = insecure mode.
+        tls_key: Path to TLS private key PEM.
+        tls_ca: Path to CA certificate PEM for mTLS client auth.
 
     Returns:
         The running ``grpc.aio.Server`` instance.
@@ -277,9 +311,17 @@ async def start_grpc_server(
 
     server = grpc_aio.server(options=options)
     inference_pb2_grpc.add_InferencePipelineServicer_to_server(servicer, server)
-    server.add_insecure_port(f"{host}:{port}")
+
+    if tls_cert and tls_key:
+        credentials = _load_tls_credentials(tls_cert, tls_key, tls_ca)
+        server.add_secure_port(f"{host}:{port}", credentials)
+        logger.info(
+            "gRPC TLS server on %s:%d (mTLS=%s)",
+            host, port, bool(tls_ca),
+        )
+    else:
+        server.add_insecure_port(f"{host}:{port}")
+        logger.warning("gRPC server on %s:%d (INSECURE - no TLS)", host, port)
 
     await server.start()
-    logger.info("gRPC server started on %s:%d", host, port)
-
     return server

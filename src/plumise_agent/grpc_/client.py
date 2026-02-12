@@ -33,7 +33,14 @@ class PipelineClient:
         timeout: Default RPC deadline in seconds.
     """
 
-    def __init__(self, target: str, timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        target: str,
+        timeout: float = 60.0,
+        tls_ca: str = "",
+        tls_cert: str = "",
+        tls_key: str = "",
+    ) -> None:
         if inference_pb2_grpc is None:
             raise ImportError(
                 "gRPC generated stubs not found. "
@@ -47,12 +54,27 @@ class PipelineClient:
             ("grpc.max_send_message_length", _MAX_MESSAGE_LENGTH),
             ("grpc.max_receive_message_length", _MAX_MESSAGE_LENGTH),
         ]
-        self.channel: grpc_aio.Channel = grpc_aio.insecure_channel(
-            target, options=options
-        )
-        self.stub = inference_pb2_grpc.InferencePipelineStub(self.channel)
 
-        logger.info("PipelineClient created for target=%s", target)
+        if tls_ca or tls_cert:
+            from pathlib import Path
+
+            root_ca = Path(tls_ca).read_bytes() if tls_ca else None
+            cert = Path(tls_cert).read_bytes() if tls_cert else None
+            key = Path(tls_key).read_bytes() if tls_key else None
+            credentials = grpc.ssl_channel_credentials(
+                root_certificates=root_ca,
+                private_key=key,
+                certificate_chain=cert,
+            )
+            self.channel: grpc_aio.Channel = grpc_aio.secure_channel(
+                target, credentials, options=options,
+            )
+            logger.info("PipelineClient TLS for target=%s", target)
+        else:
+            self.channel = grpc_aio.insecure_channel(target, options=options)
+            logger.info("PipelineClient insecure for target=%s", target)
+
+        self.stub = inference_pb2_grpc.InferencePipelineStub(self.channel)
 
     # ------------------------------------------------------------------
     # ForwardPass

@@ -1,99 +1,44 @@
-"""Tests for the PipelineTopology module.
-
-The ``PipelineTopology`` class may not be implemented yet (written by another
-agent).  These tests define the expected interface and behaviour based on
-how it is consumed in ``plumise_agent.node.node.PlumiseAgent``:
-
-    topology.is_single_node          -> bool
-    topology.find_by_address(addr)   -> (index, NodeSlot) | None
-    topology.get_next_node(index)    -> NodeSlot | None
-    PipelineTopology.fetch(url, model) -> PipelineTopology  (classmethod)
-
-If the module does not exist yet, we define a minimal reference
-implementation inside this test file so the tests are self-contained.
-"""
+"""Tests for plumise_agent.pipeline.topology -- PipelineTopology and NodeSlot."""
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 
 import pytest
 
-
-# ---------------------------------------------------------------------------
-# Minimal reference implementation for testing
-# ---------------------------------------------------------------------------
-# If the real module exists we import it; otherwise we define a stub here
-# so tests can run before the pipeline agent finishes writing the code.
-
-try:
-    from plumise_agent.pipeline.topology import PipelineTopology, NodeSlot
-except ImportError:
-
-    @dataclass(frozen=True)
-    class NodeSlot:  # type: ignore[no-redef]
-        """A node in the pipeline topology."""
-
-        address: str
-        grpc_endpoint: str
-        http_endpoint: str
-        layer_start: int
-        layer_end: int
-
-    @dataclass
-    class PipelineTopology:  # type: ignore[no-redef]
-        """Ordered list of nodes forming the inference pipeline."""
-
-        model_name: str
-        nodes: list[NodeSlot] = field(default_factory=list)
-
-        @property
-        def is_single_node(self) -> bool:
-            return len(self.nodes) <= 1
-
-        def get_next_node(self, current_index: int) -> Optional[NodeSlot]:
-            nxt = current_index + 1
-            if nxt < len(self.nodes):
-                return self.nodes[nxt]
-            return None
-
-        def find_by_address(
-            self, address: str
-        ) -> Optional[tuple[int, NodeSlot]]:
-            addr_lower = address.lower()
-            for i, node in enumerate(self.nodes):
-                if node.address.lower() == addr_lower:
-                    return (i, node)
-            return None
-
-        @classmethod
-        async def fetch(
-            cls, oracle_url: str, model_name: str
-        ) -> PipelineTopology:
-            raise NotImplementedError("fetch() requires a real Oracle")
+from plumise_agent.pipeline.topology import PipelineTopology, NodeSlot
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_node(addr: str, grpc: str, start: int, end: int) -> NodeSlot:
+def _make_node(
+    addr: str,
+    grpc: str,
+    start: int,
+    end: int,
+    order: int = 0,
+    ready: bool = True,
+) -> NodeSlot:
     return NodeSlot(
         address=addr,
         grpc_endpoint=grpc,
         http_endpoint=f"http://{grpc.split(':')[0]}:31331",
         layer_start=start,
         layer_end=end,
+        pipeline_order=order,
+        ready=ready,
     )
 
 
 def _single_node_topology() -> PipelineTopology:
     return PipelineTopology(
         model_name="test/model",
+        total_layers=24,
         nodes=[
-            _make_node("0xAAAA", "10.0.0.1:50051", 0, 24),
+            _make_node("0xAAAA", "10.0.0.1:50051", 0, 24, order=0),
         ],
     )
 
@@ -101,16 +46,17 @@ def _single_node_topology() -> PipelineTopology:
 def _multi_node_topology() -> PipelineTopology:
     return PipelineTopology(
         model_name="test/model",
+        total_layers=24,
         nodes=[
-            _make_node("0xAAAA", "10.0.0.1:50051", 0, 8),
-            _make_node("0xBBBB", "10.0.0.2:50051", 8, 16),
-            _make_node("0xCCCC", "10.0.0.3:50051", 16, 24),
+            _make_node("0xAAAA", "10.0.0.1:50051", 0, 8, order=0),
+            _make_node("0xBBBB", "10.0.0.2:50051", 8, 16, order=1),
+            _make_node("0xCCCC", "10.0.0.3:50051", 16, 24, order=2),
         ],
     )
 
 
 def _empty_topology() -> PipelineTopology:
-    return PipelineTopology(model_name="test/model", nodes=[])
+    return PipelineTopology(model_name="test/model", total_layers=24, nodes=[])
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +154,16 @@ class TestMultiNodeTopology:
         topo = _multi_node_topology()
         assert topo.find_by_address("0x9999") is None
 
+    def test_get_node_by_order(self):
+        topo = _multi_node_topology()
+        node = topo.get_node_by_order(1)
+        assert node is not None
+        assert node.address == "0xBBBB"
+
+    def test_get_node_by_order_not_found(self):
+        topo = _multi_node_topology()
+        assert topo.get_node_by_order(99) is None
+
 
 # ---------------------------------------------------------------------------
 # Empty topology
@@ -229,6 +185,14 @@ class TestEmptyTopology:
         topo = _empty_topology()
         assert topo.get_next_node(0) is None
 
+    def test_first_node_none(self):
+        topo = _empty_topology()
+        assert topo.first_node is None
+
+    def test_last_node_none(self):
+        topo = _empty_topology()
+        assert topo.last_node is None
+
 
 # ---------------------------------------------------------------------------
 # is_single_node boundary
@@ -238,22 +202,24 @@ class TestIsSingleNodeBoundary:
     """Explicitly verify the boundary between single and multi."""
 
     def test_zero_nodes(self):
-        topo = PipelineTopology(model_name="m", nodes=[])
+        topo = PipelineTopology(model_name="m", total_layers=10, nodes=[])
         assert topo.is_single_node is True
 
     def test_one_node(self):
         topo = PipelineTopology(
             model_name="m",
-            nodes=[_make_node("0xA", "1:2", 0, 10)],
+            total_layers=10,
+            nodes=[_make_node("0xA", "1:2", 0, 10, order=0)],
         )
         assert topo.is_single_node is True
 
     def test_two_nodes(self):
         topo = PipelineTopology(
             model_name="m",
+            total_layers=10,
             nodes=[
-                _make_node("0xA", "1:2", 0, 5),
-                _make_node("0xB", "3:4", 5, 10),
+                _make_node("0xA", "1:2", 0, 5, order=0),
+                _make_node("0xB", "3:4", 5, 10, order=1),
             ],
         )
         assert topo.is_single_node is False
@@ -267,21 +233,98 @@ class TestNodeSlotAttributes:
     """Verify NodeSlot exposes the expected attributes."""
 
     def test_address(self):
-        n = _make_node("0xABC", "host:50051", 0, 8)
+        n = _make_node("0xABC", "host:50051", 0, 8, order=0)
         assert n.address == "0xABC"
 
     def test_grpc_endpoint(self):
-        n = _make_node("0xABC", "host:50051", 0, 8)
+        n = _make_node("0xABC", "host:50051", 0, 8, order=0)
         assert n.grpc_endpoint == "host:50051"
 
     def test_layer_bounds(self):
-        n = _make_node("0xABC", "host:50051", 4, 12)
+        n = _make_node("0xABC", "host:50051", 4, 12, order=0)
         assert n.layer_start == 4
         assert n.layer_end == 12
 
     def test_http_endpoint(self):
-        n = _make_node("0xABC", "host:50051", 0, 8)
+        n = _make_node("0xABC", "host:50051", 0, 8, order=0)
         assert n.http_endpoint == "http://host:31331"
+
+    def test_pipeline_order(self):
+        n = _make_node("0xABC", "host:50051", 0, 8, order=5)
+        assert n.pipeline_order == 5
+
+    def test_ready_default_true(self):
+        n = _make_node("0xABC", "host:50051", 0, 8, order=0)
+        assert n.ready is True
+
+    def test_ready_false(self):
+        n = _make_node("0xABC", "host:50051", 0, 8, order=0, ready=False)
+        assert n.ready is False
+
+    def test_frozen(self):
+        n = _make_node("0xABC", "host:50051", 0, 8, order=0)
+        with pytest.raises(AttributeError):
+            n.address = "0xDEF"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# first_node / last_node
+# ---------------------------------------------------------------------------
+
+class TestFirstLastNode:
+    """Test the first_node and last_node properties."""
+
+    def test_first_node_single(self):
+        topo = _single_node_topology()
+        assert topo.first_node is not None
+        assert topo.first_node.address == "0xAAAA"
+
+    def test_last_node_single(self):
+        topo = _single_node_topology()
+        assert topo.last_node is not None
+        assert topo.last_node.address == "0xAAAA"
+
+    def test_first_node_multi(self):
+        topo = _multi_node_topology()
+        assert topo.first_node is not None
+        assert topo.first_node.pipeline_order == 0
+
+    def test_last_node_multi(self):
+        topo = _multi_node_topology()
+        assert topo.last_node is not None
+        assert topo.last_node.pipeline_order == 2
+
+
+# ---------------------------------------------------------------------------
+# to_dict serialization
+# ---------------------------------------------------------------------------
+
+class TestToDict:
+    """Test the to_dict serialization."""
+
+    def test_to_dict_keys(self):
+        topo = _multi_node_topology()
+        d = topo.to_dict()
+        assert "model" in d
+        assert "totalLayers" in d
+        assert "nodes" in d
+
+    def test_to_dict_node_count(self):
+        topo = _multi_node_topology()
+        d = topo.to_dict()
+        assert len(d["nodes"]) == 3
+
+    def test_to_dict_node_fields(self):
+        topo = _single_node_topology()
+        d = topo.to_dict()
+        node = d["nodes"][0]
+        assert "address" in node
+        assert "grpcEndpoint" in node
+        assert "httpEndpoint" in node
+        assert "layerStart" in node
+        assert "layerEnd" in node
+        assert "pipelineOrder" in node
+        assert "ready" in node
 
 
 # ---------------------------------------------------------------------------
@@ -294,18 +337,36 @@ class TestPipelineTraversal:
     def test_traverse_entire_pipeline(self):
         topo = _multi_node_topology()
         visited_addresses = []
-        idx = 0
         # Start from first node
         result = topo.find_by_address("0xAAAA")
         assert result is not None
         idx, node = result
         visited_addresses.append(node.address)
 
+        current_order = node.pipeline_order
         while True:
-            nxt = topo.get_next_node(idx)
+            nxt = topo.get_next_node(current_order)
             if nxt is None:
                 break
             visited_addresses.append(nxt.address)
-            idx += 1
+            current_order = nxt.pipeline_order
 
         assert visited_addresses == ["0xAAAA", "0xBBBB", "0xCCCC"]
+
+
+# ---------------------------------------------------------------------------
+# repr
+# ---------------------------------------------------------------------------
+
+class TestRepr:
+    """Ensure repr is informative."""
+
+    def test_repr_contains_model(self):
+        topo = _single_node_topology()
+        r = repr(topo)
+        assert "test/model" in r
+
+    def test_repr_contains_layer_count(self):
+        topo = _single_node_topology()
+        r = repr(topo)
+        assert "24" in r

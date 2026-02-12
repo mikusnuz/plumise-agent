@@ -212,7 +212,8 @@ class PlumiseAgent:
             from plumise_agent.model.loader import ModelLoader
 
             loader = ModelLoader(
-                self.config.model_name, self.config.device, self.config.hf_token
+                self.config.model_name, self.config.device, self.config.hf_token,
+                expected_hash=self.config.model_hash,
             )
             total = loader.get_total_layers()
             self.layer_range = LayerRange(
@@ -323,7 +324,12 @@ class PlumiseAgent:
                 slot_index, _ = my_slot
                 next_node = self.topology.get_next_node(slot_index)
                 if next_node:
-                    grpc_client = PipelineClient(next_node.grpc_endpoint)
+                    grpc_client = PipelineClient(
+                        next_node.grpc_endpoint,
+                        tls_ca=self.config.grpc_tls_ca,
+                        tls_cert=self.config.grpc_tls_cert,
+                        tls_key=self.config.grpc_tls_key,
+                    )
                     logger.info(
                         "Pipeline: forwarding to next node %s (%s)",
                         next_node.address[:10] + "...",
@@ -338,7 +344,12 @@ class PlumiseAgent:
         )
 
         self.grpc_server = await start_grpc_server(
-            servicer, self.config.grpc_host, self.config.grpc_port
+            servicer,
+            self.config.grpc_host,
+            self.config.grpc_port,
+            tls_cert=self.config.grpc_tls_cert,
+            tls_key=self.config.grpc_tls_key,
+            tls_ca=self.config.grpc_tls_ca,
         )
         logger.info(
             "gRPC server started on %s:%d",

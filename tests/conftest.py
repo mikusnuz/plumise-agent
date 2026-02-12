@@ -7,12 +7,45 @@ so individual test modules can stay focused on their own assertions.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+# ---------------------------------------------------------------------------
+# Stub heavy optional dependencies that are not needed for unit tests.
+# This prevents importing transformers/web3/etc when they are not installed.
+# ---------------------------------------------------------------------------
+
+for _mod_name in (
+    "transformers",
+    "transformers.models",
+    "accelerate",
+    "safetensors",
+    "sentencepiece",
+    "tokenizers",
+    "web3",
+    "web3.contract",
+    "eth_account",
+    "eth_account.account",
+    "eth_account.messages",
+    "aiohttp",
+    "fastapi",
+    "uvicorn",
+    "grpcio",
+    "grpc",
+    "grpc.aio",
+    "psutil",
+    # Generated protobuf stubs (built from proto/inference.proto)
+    "plumise_agent.grpc_.generated.inference_pb2",
+    "plumise_agent.grpc_.generated.inference_pb2_grpc",
+):
+    if _mod_name not in sys.modules:
+        sys.modules[_mod_name] = MagicMock()
+
+# Now safe to import plumise_agent submodules
 from plumise_agent.model.layer_range import LayerRange
 
 
@@ -27,32 +60,30 @@ def mock_config():
     The private key is a well-known Hardhat/Foundry test key so no real
     funds are ever at risk.
     """
-    # Prevent pydantic-settings from reading a real .env file
-    with patch.dict(os.environ, {}, clear=False):
-        from plumise_agent.chain.config import AgentConfig
+    from plumise_agent.chain.config import AgentConfig
 
-        return AgentConfig(
-            plumise_rpc_url="http://localhost:26902",
-            plumise_chain_id=41956,
-            plumise_private_key="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
-            agent_registry_address=None,
-            reward_pool_address=None,
-            oracle_api_url="http://localhost:3100",
-            report_interval=60,
-            model_name="test-org/test-model",
-            device="cpu",
-            hf_token="",
-            layer_start=None,
-            layer_end=None,
-            grpc_host="0.0.0.0",
-            grpc_port=50051,
-            api_host="0.0.0.0",
-            api_port=31331,
-            node_endpoint="",
-            grpc_endpoint="",
-            verify_on_chain=False,
-            claim_threshold_wei=10**18,
-        )
+    return AgentConfig(
+        plumise_rpc_url="http://localhost:26902",
+        plumise_chain_id=41956,
+        plumise_private_key="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        agent_registry_address=None,
+        reward_pool_address=None,
+        oracle_api_url="http://localhost:3100",
+        report_interval=60,
+        model_name="test-org/test-model",
+        device="cpu",
+        hf_token="",
+        layer_start=None,
+        layer_end=None,
+        grpc_host="0.0.0.0",
+        grpc_port=50051,
+        api_host="0.0.0.0",
+        api_port=31331,
+        node_endpoint="",
+        grpc_endpoint="",
+        verify_on_chain=False,
+        claim_threshold_wei=10**18,
+    )
 
 
 # ---------------------------------------------------------------------------
