@@ -375,9 +375,28 @@ class PlumiseAgent:
         )
 
     async def _register_on_chain(self) -> None:
-        """Register the agent on-chain via precompile 0x21."""
+        """Register the agent on-chain via precompile 0x21.
+
+        If the agent has no PLM balance, skip the direct transaction and let
+        the Oracle sponsor the registration when the agent registers with it.
+        """
         if self.chain_agent.is_registered:
             logger.info("Agent already registered on-chain")
+            return
+
+        # Check if we already have on-chain registration (from a previous run)
+        if self.auth.verify_registration():
+            logger.info("Agent already registered on-chain (verified via AgentRegistry)")
+            self.chain_agent._registered = True
+            return
+
+        # Check balance — if zero, Oracle will sponsor registration
+        balance = self.auth.get_balance()
+        if balance == 0:
+            logger.info(
+                "Agent has 0 PLM balance; skipping direct on-chain registration. "
+                "Oracle will sponsor registration via precompile 0x21 with beneficiary."
+            )
             return
 
         # Derive agent name from model + address suffix
@@ -399,7 +418,10 @@ class PlumiseAgent:
         if success:
             logger.info("Agent on-chain registration complete")
         else:
-            logger.warning("Agent on-chain registration failed; will retry on next start")
+            logger.warning(
+                "Agent on-chain registration failed; "
+                "Oracle will attempt sponsored registration"
+            )
 
     # ------------------------------------------------------------------
     # Background maintenance loops

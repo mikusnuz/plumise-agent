@@ -31,8 +31,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Determine base class: use the generated servicer if available, else fall
+# back to ``object`` so the module can still be imported even when the proto
+# stubs have not been generated yet (e.g. in a PyInstaller bundle that
+# forgot to run generate_proto.sh).  ``start_grpc_server()`` already guards
+# against a None ``inference_pb2_grpc`` at runtime.
+_ServicerBase = (
+    inference_pb2_grpc.InferencePipelineServicer
+    if inference_pb2_grpc is not None
+    else object
+)
 
-class InferencePipelineServicer(inference_pb2_grpc.InferencePipelineServicer):
+
+class InferencePipelineServicer(_ServicerBase):
     """Implements the ``InferencePipeline`` gRPC service.
 
     Args:
