@@ -128,26 +128,27 @@ class PlumiseAgent:
         # Step 1: Verify chain connectivity and agent registration
         await self._preflight_checks()
 
-        # Step 2: Register with Oracle, get layer assignment
+        # Step 2: Register on-chain via precompile 0x21 (must precede Oracle)
+        # Oracle verifies on-chain registration, so this must happen first.
+        await self._register_on_chain()
+
+        # Step 3: Register with Oracle, get layer assignment
         await self._register_with_oracle()
 
-        # Step 3: Load assigned model layers
+        # Step 4: Load assigned model layers
         await self._load_model()
 
-        # Step 4: Initialize pipeline executor
+        # Step 5: Initialize pipeline executor
         self._init_executor()
 
-        # Step 5: Start gRPC server for inter-node communication
+        # Step 6: Start gRPC server for inter-node communication
         await self._start_grpc_server()
 
-        # Step 6: Start HTTP API
+        # Step 7: Start HTTP API
         self._start_api_server()
 
-        # Step 7: Report ready to Oracle
+        # Step 8: Report ready to Oracle
         await self.registry.report_ready()
-
-        # Step 8: Register on-chain via precompile 0x21
-        await self._register_on_chain()
 
         # Step 9: Start background tasks
         self._running = True
@@ -416,7 +417,17 @@ class PlumiseAgent:
                 await asyncio.sleep(interval)
                 new_topology = await self.registry.get_topology()
                 if new_topology is not None:
+                    old_count = len(self.topology.nodes) if self.topology else 0
                     self.topology = new_topology
+                    if self.executor:
+                        self.executor.update_topology(new_topology)
+                    new_count = len(new_topology.nodes)
+                    if new_count != old_count:
+                        logger.info(
+                            "Topology changed: %d → %d nodes",
+                            old_count,
+                            new_count,
+                        )
             except asyncio.CancelledError:
                 break
             except Exception:
