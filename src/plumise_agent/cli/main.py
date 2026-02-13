@@ -142,7 +142,8 @@ def start(
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    agent.install_signal_handlers(loop)
+    if os.name != "nt":
+        agent.install_signal_handlers(loop)
 
     try:
         loop.run_until_complete(agent.start())

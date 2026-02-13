@@ -582,4 +582,8 @@ class PlumiseAgent:
     def install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
         """Install SIGINT/SIGTERM handlers for graceful shutdown."""
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self.request_shutdown)
+            try:
+                loop.add_signal_handler(sig, self.request_shutdown)
+            except (NotImplementedError, RuntimeError):
+                logger.debug("Signal handlers not supported on this platform")
+                break
