@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -128,30 +130,61 @@ def create_app(agent: PlumiseAgent) -> FastAPI:
 
     @app.post(
         "/api/v1/generate",
-        response_model=GenerateResponse,
         dependencies=[Depends(require_auth)],
     )
-    async def generate(request: GenerateRequest) -> GenerateResponse:
-        """Generate text from a prompt (auth required)."""
+    async def generate(request: GenerateRequest):
+        """Generate text from a prompt (auth required). Supports SSE streaming."""
         if agent.engine is None:
             raise HTTPException(status_code=503, detail="Model is still loading")
 
         params = request.parameters or GenerateParams()
+        gen_params = {
+            "max_new_tokens": params.max_new_tokens,
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "repetition_penalty": params.repetition_penalty,
+            "do_sample": params.do_sample,
+        }
+
+        # --- Streaming mode ---
+        if request.stream and agent.executor is not None:
+            async def sse_generator():
+                num_tokens = 0
+                start = time.time()
+                try:
+                    async for token in agent.executor.generate_stream(
+                        prompt=request.inputs,
+                        params=gen_params,
+                    ):
+                        num_tokens += 1
+                        yield f"data: {json.dumps({'token': token})}\n\n"
+                    yield "data: [DONE]\n\n"
+                except Exception as exc:
+                    logger.exception("Streaming inference failed")
+                    yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                finally:
+                    latency_ms = (time.time() - start) * 1000
+                    if num_tokens > 0:
+                        agent.record_inference(
+                            input_data=request.inputs,
+                            output_data=f"[streamed {num_tokens} tokens]",
+                            token_count=num_tokens,
+                            latency_ms=latency_ms,
+                        )
+
+            return StreamingResponse(
+                sse_generator(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # --- Non-streaming mode ---
         start = time.time()
 
         try:
             loop = asyncio.get_running_loop()
-            gen_params = {
-                "max_new_tokens": params.max_new_tokens,
-                "temperature": params.temperature,
-                "top_p": params.top_p,
-                "repetition_penalty": params.repetition_penalty,
-                "do_sample": params.do_sample,
-            }
 
-            # Decide execution path based on layer assignment
             if agent.layer_range and agent.layer_range.is_full:
-                # Single-node mode: run locally via forward_full
                 generated_text, num_tokens = await loop.run_in_executor(
                     None,
                     lambda: agent.engine.forward_full(  # type: ignore[union-attr]
@@ -160,13 +193,11 @@ def create_app(agent: PlumiseAgent) -> FastAPI:
                     ),
                 )
             elif agent.executor is not None:
-                # Pipeline mode: use the executor
                 generated_text, num_tokens = await agent.executor.generate(
                     prompt=request.inputs,
                     params=gen_params,
                 )
             else:
-                # Fallback: try local engine even if not full
                 generated_text, num_tokens = await loop.run_in_executor(
                     None,
                     lambda: agent.engine.forward_full(  # type: ignore[union-attr]
@@ -184,7 +215,6 @@ def create_app(agent: PlumiseAgent) -> FastAPI:
 
         latency_ms = (time.time() - start) * 1000
 
-        # Record metrics and generate proof
         agent.record_inference(
             input_data=request.inputs,
             output_data=generated_text,

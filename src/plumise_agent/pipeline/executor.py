@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, AsyncGenerator
 
 import torch
 
@@ -116,6 +116,37 @@ class PipelineExecutor:
             "PipelineExecutor.generate() should only be called on the "
             "first node or a single-node deployment. Middle/last nodes "
             "receive work via the gRPC ForwardPass RPC."
+        )
+
+    async def generate_stream(
+        self,
+        prompt: str,
+        params: dict | None = None,
+        request_id: str | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Streaming version of generate(). Yields token text strings.
+
+        For single-node mode, yields the entire result at once.
+        For pipeline mode, yields each token as it is generated.
+        """
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+        if params is None:
+            params = {}
+
+        if self._topology.is_single_node or self._layer_range.is_full:
+            text, _ = self._execute_local(prompt, params)
+            yield text
+            return
+
+        if self._layer_range.is_first:
+            async for token in self._execute_pipeline_stream(prompt, params, request_id):
+                yield token
+            return
+
+        raise RuntimeError(
+            "generate_stream() should only be called on the first node "
+            "or a single-node deployment."
         )
 
     # ------------------------------------------------------------------
@@ -249,6 +280,93 @@ class PipelineExecutor:
         )
 
         return text, num_tokens
+
+    async def _execute_pipeline_stream(
+        self,
+        prompt: str,
+        params: dict,
+        request_id: str,
+    ) -> AsyncGenerator[str, None]:
+        """Streaming pipeline generation. Yields decoded token text per step."""
+        t0 = time.perf_counter()
+        max_new_tokens = params.get("max_new_tokens", 128)
+
+        logger.info(
+            "Pipeline streaming generation: request_id=%s max_tokens=%d nodes=%d",
+            request_id,
+            max_new_tokens,
+            len(self._topology.nodes),
+        )
+
+        inputs = self._engine.tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(self._engine.device)
+
+        next_node = self._topology.get_next_node(self._my_order)
+        if next_node is None:
+            raise RuntimeError(
+                "Pipeline has no next node after order "
+                f"{self._my_order}, but this is not the last node."
+            )
+
+        gen_params = self._build_gen_params(params)
+        metadata = self._build_metadata(prompt, request_id)
+
+        client = PipelineClient(
+            target=next_node.grpc_endpoint,
+            timeout=30.0,
+        )
+
+        generated_tokens: list[int] = []
+
+        try:
+            for step in range(max_new_tokens):
+                hidden_states = self._engine.forward_first_ids(input_ids)
+                hs_bytes, hs_shape, hs_dtype = serialize_tensor(hidden_states)
+
+                response = await client.forward(
+                    request_id=f"{request_id}_s{step}",
+                    hidden_states=hs_bytes,
+                    shape=hs_shape,
+                    dtype=hs_dtype,
+                    params=gen_params,
+                    metadata=metadata,
+                    past_token_ids=generated_tokens,
+                )
+
+                if not response.success:
+                    raise RuntimeError(
+                        f"Pipeline forward failed at step {step}: {response.error}"
+                    )
+
+                if response.is_eos:
+                    logger.debug("EOS received at step %d", step)
+                    break
+
+                token_id = response.next_token_id
+                generated_tokens.append(token_id)
+
+                token_text = self._engine.tokenizer.decode(
+                    [token_id], skip_special_tokens=False
+                )
+                yield token_text
+
+                next_token = torch.tensor(
+                    [[token_id]], dtype=torch.long, device=self._engine.device
+                )
+                input_ids = torch.cat([input_ids, next_token], dim=1)
+
+        finally:
+            await client.close()
+
+        num_tokens = len(generated_tokens)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "Pipeline streaming complete: request_id=%s tokens=%d latency=%.0fms (%.1f tok/s)",
+            request_id,
+            num_tokens,
+            elapsed_ms,
+            num_tokens / (elapsed_ms / 1000) if elapsed_ms > 0 else 0,
+        )
 
     # ------------------------------------------------------------------
     # Protobuf builders
