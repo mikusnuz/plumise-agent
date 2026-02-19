@@ -2,6 +2,8 @@
 
 # Plumise Agent
 
+![version](https://img.shields.io/badge/version-0.1.0-blue)
+
 > Plumise 블록체인을 위한 분산 LLM 추론 에이전트. 컴퓨팅 파워를 제공하고 PLM 보상을 획득하세요.
 
 ## 개요

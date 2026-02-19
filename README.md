@@ -2,6 +2,8 @@
 
 # Plumise Agent
 
+![version](https://img.shields.io/badge/version-0.1.0-blue)
+
 > Distributed LLM inference agent for the Plumise blockchain. Provide compute power, earn PLM rewards.
 
 ## Overview
